@@ -1,0 +1,84 @@
+#
+# - state-machine controlling...
+#
+initial: setup
+terminal: stop
+states:
+- tag: setup
+  shell: |
+
+    #
+    # - append the statsd telegraf input
+    # - start telegraf
+    #
+    cat <<EOT >> /etc/telegraf/telegraf.conf
+    [[inputs.statsd]]
+      service_address = "127.0.0.1:8125"
+    EOT
+    supervisorctl start telegraf
+    echo GOTO reset | socat - $SOCKET
+  next:
+    - reset
+
+- tag: reset
+  shell: |
+
+    #
+    # - initialize our little payload on disk
+    # - this is used to keep track of what the offset is
+    # - it also stores the latest MD5 digest to compare against
+    # - start consuming to reset the offset to the head
+    #
+    echo '{"batch": 0, "last":0, "md5": ""}' > /tmp/state
+    echo GOTO consume | socat - $SOCKET
+  next:
+    - consume
+
+- tag: produce
+  shell: |
+  
+    #
+    # - run produce.py
+    # - this will generate a random amount of records on our topic
+    # - the final MD5 digest of all those records will be written to /tmp/state
+    # - upon failure log an alert and trip the machine back to reset
+    # - otherwise proceed to consume those records
+    #
+    STATE=$(cat /tmp/state | python produce.py)
+    if [ $? -ne 0 ]; then
+      echo "alert:1|c" | nc -w 1 -u 127.0.0.1 8125
+      echo GOTO reset | socat - $SOCKET
+    else
+      echo $STATE > /tmp/state
+      echo GOTO consume | socat - $SOCKET
+    fi
+  next: 
+    - reset
+    - consume
+
+- tag: consume
+  shell: |
+  
+    #
+    # - run consume.py
+    # - this will attempt to read all the records previously produced
+    # - the MD5 digest from /tmp/state will be compared to the latest one
+    # - the offset will also be updated
+    # - upon failure log an alert and trip the machine back to reset
+    # - otherwise loop back and produce a new batch
+    #
+    STATE=$(cat /tmp/state | python consume.py)
+    if [ $? -ne 0 ]; then
+      echo "alert:1|c" | nc -w 1 -u 127.0.0.1 8125
+      echo GOTO reset | socat - $SOCKET
+    else
+      echo $STATE > /tmp/state
+      echo GOTO produce | socat - $SOCKET
+    fi
+  next: 
+    - reset
+    - produce
+
+- tag: stop
+  shell: |
+    echo terminating  
